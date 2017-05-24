@@ -1,0 +1,170 @@
+setwd('D:\\Sagar\\Large_rto')
+install.packages('rotationForest')
+library('dplyr')
+library(polycor)
+library(usdm)
+library(e1071)
+library(caret)
+library(lattice)
+library(ggplot2)
+library(ROCR)
+library(lift)
+library(gains)
+library(randomForest)
+library(rpart)
+library(rotationForest)
+
+## Read data and format
+model_data <- read.csv(file=".\\new_data_repository\\train_data_jf_17.csv",header = T,fileEncoding="UTF-8-BOM")
+dummy_data <- read.csv(file=".\\new_data_repository\\dummy.csv",header = T,fileEncoding="UTF-8-BOM")
+
+valid_data <- read.csv(file=".\\new_data_repository\\valid_data_all_march_2017.csv",header = T,fileEncoding="UTF-8-BOM")
+valid_data$is_rto_flag<-1
+valid_data$ica_flag <-as.factor(ifelse(valid_data$score>=0.74,'High','Low'))
+ 
+dummy_variables<-names(dummy_data)
+dummy_data<-subset(dummy_data,select=-c(order_created_date))
+
+valid_data<-valid_data[,names(valid_data) %in% dummy_variables]
+
+
+model_data<-subset(model_data,select=-c(order_quantity))
+valid_data<-subset(valid_data,select=-c(is_exchange))
+str(valid_data)
+as_factor <- c('is_rto_flag' ,'is_replacement','is_exchange_flag','order_hour','is_new_customer_flag')
+model_data[,as_factor] <- lapply(model_data[,as_factor] , factor)
+dummy_data[,as_factor] <- lapply(dummy_data[,as_factor] , factor)
+valid_data[,as_factor] <- lapply(valid_data[,as_factor] , factor)
+
+model_data<-rbind(model_data,dummy_data)
+
+valid_data<-rbind(valid_data,dummy_data)
+
+model_data<-valid_data
+
+# Check for missing values
+missing_fun=function(a){
+  return(length(a)-length(a[! is.na(a)]))
+}
+
+missing_values_table=data.frame(
+  Vars=names(model_data),
+  N=apply(model_data,2,length),
+  NMISS=apply(model_data,2,missing_fun)
+)
+
+
+levels(model_data$address_state)
+#Split data for development and validation
+sample.ind <- sample(2, 
+                     nrow(model_data),
+                     replace = T,
+                     prob = c(0.8,0.2))
+model_data_dev <- model_data[sample.ind==1,]
+model_data_test <- model_data[sample.ind==2,]
+
+
+## Explore data frame
+str(model_data_dev)
+str(model_data_test)
+table(model_data$is_rto_flag)/nrow(model_data)
+table(model_data_dev$is_rto_flag)/nrow(model_data_dev)
+table(model_data_test$is_rto_flag)/nrow(model_data_test)
+
+allvarNames <- names(model_data)
+varNames <- allvarNames[!allvarNames %in% c('is_rto_flag','order_item_unit_id','order_external_id','order_created_date','account_id','product_id')]
+varNames_form <- paste(varNames, collapse = "+")
+
+# Add response variable and convert to a formula object
+rf.form <- as.formula(paste("is_rto_flag", varNames_form, sep = " ~ "))
+
+# 
+
+#Building Random Forest using R
+rf.rto <- randomForest(rf.form,
+                       model_data_dev,
+                       ntree=309,
+                       importance=T,
+                       mtry=3)
+
+plot(rf.rto)
+
+rf.rto$confusion
+Recall<-rf.rto$confusion[2,2]/(rf.rto$confusion[2,2]+rf.rto$confusion[2,1])
+Precision<-rf.rto$confusion[2,2]/(rf.rto$confusion[2,2]+rf.rto$confusion[1,2])
+
+
+model.rf <- rf.rto
+
+# Variable Importance Plot
+varImpPlot(model.rf,
+           sort = T,
+           main="Variable Importance",
+           n.var=5)
+
+#Variables with highest Gini Values
+var_gini <- data.frame(importance(model.rf,type=2))
+write.csv(var_gini,"gini_table.csv")
+
+#Using only most significant variables
+varNames_gini <- varNames[varNames %in% c('customer_contacts_per_order','order_day','brand','address_state','customer_recency_in_days','customer_rto_percent','final_promised_sla_in_days','product_contacts_per_order','product_frequency_in_days','order_original_billing_amount_final','product_rto_percent','product_rvp_percent','payment_type','city_class','promotion_discount_actual')]
+varNames_gini_form <- paste(varNames_gini, collapse = "+")
+
+# Add response variable and convert to a formula object
+rf.form_gini <- as.formula(paste("is_rto", varNames_gini_form, sep = " ~ "))
+rf.rto <- randomForest(rf.form_gini,
+                       model_data_dev,
+                       ntree=501,
+                       importance=T,
+                       mtry=3)
+
+#Predict RTO using rf.rto model on test (based on gini variables only) and plot confusion matrix
+model_data_test$predicted.response <- predict(rf.rto ,model_data_test,type='response')
+model_data_test$predicted.prob<- predict(rf.rto ,model_data_test,type='prob')
+
+model_data_test$predicted.rto_prob<-model_data_test$predicted.prob[,2]
+model_data_test$predicted.response_2 <-as.factor(ifelse(model_data_test$predicted.rto_prob>=0.36,1,0))
+
+conf_test<-confusionMatrix(data=model_data_test$predicted.response,
+                reference=model_data_test$is_rto_flag,
+                positive='1')
+
+conf_test_2<-confusionMatrix(data=model_data_test$predicted.response_2,
+                           reference=model_data_test$is_rto_flag,
+                           positive='1')
+
+test_recall<-conf_test$byClass['Recall']
+test_precision<-conf_test$byClass['Precision']
+
+test_recall_2<-conf_test_2$byClass['Recall']
+test_precision_2<-conf_test_2$byClass['Precision']
+
+conf_test$table
+conf_test_2$table
+
+
+#write.csv(model_data_test,"model_data_test.csv")
+
+valid_data$predicted.response <- predict(rf.rto ,valid_data,type='response')
+valid_data$predicted.prob<- predict(rf.rto ,valid_data,type='prob')
+
+valid_data$predicted.rto_prob<-valid_data$predicted.prob[,2]
+valid_data$predicted.response_2 <-as.factor(ifelse(valid_data$predicted.rto_prob>=0.54,1,0))
+
+
+conf_valid<-confusionMatrix(data=valid_data$predicted.response,
+                             reference=valid_data$is_rto_flag,
+                             positive='1')
+
+conf_valid_2<-confusionMatrix(data=valid_cod_data$predicted.response_2,
+                           reference=valid_cod_data$is_rto_flag,
+                           positive='1')
+
+valid_cod_data<-valid_data[valid_data$payment_type=='cod',]
+
+
+valid_recall<-conf_valid$byClass['Recall']
+valid_precision<-conf_valid$byClass['Precision']
+
+valid_recall_2<-conf_valid_2$byClass['Recall']
+valid_precision_2<-conf_valid_2$byClass['Precision']
